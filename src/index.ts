@@ -1,0 +1,26 @@
+import 'reflect-metadata';
+
+export * from './container';
+export * from './decorators';
+export * from './interfaces';
+export * from './metadata';
+export * from './module';
+export * from './router';
+export * from './application';
+export * from './pipeline';
+export * from './exceptions';
+export * from './pipes';
+export * from './middleware';
+export * from './lifecycle';
+export * from './versioning/versioning';
+export * from './cluster';
+export * from './resilience';
+
+export {
+  ConfigModule,
+  ConfigService,
+  registerAs,
+  CONFIG_OPTIONS,
+  CONFIGURATION_TOKEN,
+  CONFIGURATION_SERVICE_TOKEN,
+} from './config';
