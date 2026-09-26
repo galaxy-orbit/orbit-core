@@ -80,8 +80,42 @@ class ExecutionContextImpl implements ExecutionContext {
   }
 }
 
+interface CachedPipelineMeta {
+  guards: any[];
+  pipes: any[];
+  interceptors: any[];
+  filters: any[];
+}
+
 export class ExecutionPipeline {
+  /** Per-controller pipeline metadata, resolved once instead of per request. */
+  private metaCache = new WeakMap<Type, Map<string, CachedPipelineMeta>>();
+
   constructor(private container: Container) {}
+
+  private getCachedMeta(controllerClass: Type, methodName: string): CachedPipelineMeta {
+    let byMethod = this.metaCache.get(controllerClass);
+    if (!byMethod) {
+      byMethod = new Map();
+      this.metaCache.set(controllerClass, byMethod);
+    }
+    let meta = byMethod.get(methodName);
+    if (!meta) {
+      meta = {
+        guards: this.getGuards(controllerClass, null, methodName),
+        pipes: this.getPipes(controllerClass, null, methodName),
+        interceptors: this.getInterceptors(controllerClass, null, methodName),
+        filters: this.getFilters(controllerClass, null, methodName),
+      };
+      byMethod.set(methodName, meta);
+    }
+    return meta;
+  }
+
+  /** True when the handler has registered pipes (parameter transformation). */
+  hasPipes(controllerClass: Type, methodName: string): boolean {
+    return this.getCachedMeta(controllerClass, methodName).pipes.length > 0;
+  }
 
   async execute(
     request: Request,
@@ -91,10 +125,24 @@ export class ExecutionPipeline {
     methodName: string,
     handlerFn: () => Promise<any>
   ): Promise<Response> {
+    const meta = this.getCachedMeta(controllerClass, methodName);
+
+    // Fast path: no guards, no interceptors, no exception filters — run the
+    // handler directly. Skips ExecutionContext construction and the
+    // guard/interceptor promise chains entirely.
+    if (meta.guards.length === 0 && meta.interceptors.length === 0 && meta.filters.length === 0) {
+      try {
+        const result = await handlerFn();
+        return this.transformToResponse(result);
+      } catch (error) {
+        return await this.handleException(error, null as any, controllerClass, controllerInstance, methodName);
+      }
+    }
+
     const context = new ExecutionContextImpl(request, controllerClass, handler);
 
     try {
-      const guardsPassed = await this.runGuards(context, controllerClass, controllerInstance, methodName);
+      const guardsPassed = await this.runGuards(meta, context);
       if (!guardsPassed) {
         return new Response(JSON.stringify({ statusCode: 403, message: 'Forbidden' }), {
           status: 403,
@@ -102,7 +150,7 @@ export class ExecutionPipeline {
         });
       }
 
-      const result = await this.runInterceptors(context, controllerClass, controllerInstance, methodName, handlerFn);
+      const result = await this.runInterceptors(meta, context, handlerFn);
       return this.transformToResponse(result);
     } catch (error) {
       return await this.handleException(error, context, controllerClass, controllerInstance, methodName);
@@ -110,12 +158,10 @@ export class ExecutionPipeline {
   }
 
   private async runGuards(
-    context: ExecutionContext,
-    controllerClass: Type,
-    instance: any,
-    methodName: string
+    meta: CachedPipelineMeta,
+    context: ExecutionContext
   ): Promise<boolean> {
-    const guards = this.getGuards(controllerClass, instance, methodName);
+    const guards = meta.guards;
     
     for (const guard of guards) {
       const guardInstance = await this.resolveInstance(guard) as CanActivate;
@@ -129,13 +175,11 @@ export class ExecutionPipeline {
   }
 
   private async runInterceptors(
+    meta: CachedPipelineMeta,
     context: ExecutionContext,
-    controllerClass: Type,
-    instance: any,
-    methodName: string,
     handlerFn: () => Promise<any>
   ): Promise<any> {
-    const interceptors = this.getInterceptors(controllerClass, instance, methodName);
+    const interceptors = meta.interceptors;
     
     if (interceptors.length === 0) {
       return handlerFn();
@@ -181,7 +225,7 @@ export class ExecutionPipeline {
     instance: any,
     methodName: string
   ): Promise<Response> {
-    const filters = this.getFilters(controllerClass, instance, methodName);
+    const filters = this.getCachedMeta(controllerClass, methodName).filters;
     
     for (const filter of filters) {
       const filterInstance = await this.resolveInstance(filter) as ExceptionFilter;

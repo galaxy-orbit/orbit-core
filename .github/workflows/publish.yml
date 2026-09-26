@@ -21,6 +21,8 @@ jobs:
           registry-url: 'https://registry.npmjs.org'
       - run: bun install
       - run: bun run build
+      # Ship real .d.ts — the previous release pointed "types" at a missing file.
+      - run: bun run build:types
       - run: bunx changeset version || echo "no pending changesets"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,4 +1,5 @@
 import 'reflect-metadata';
+import { applySecureHeaderRecord, buildSecureHeaders, type SecureHeaderOptions } from '@galaxy-stack/orbit-common';
 import type { Type } from '../interfaces/type.interface';
 import type { DynamicModule } from '../interfaces/module.interface';
 import { Container } from '../container/container';
@@ -27,11 +28,22 @@ export interface OrbitApplicationOptions {
   hostname?: string;
   logger?: boolean | Console;
   cors?: boolean | CorsOptions;
+  /**
+   * Secure response headers (helmet-style) applied to every response by
+   * default. Set `false` to disable, or pass an object to customize
+   * individual headers. CSRF / rate limiting / sanitization stay opt-in via
+   * SecurityModule and ThrottlerModule.
+   */
+  security?: boolean | SecureHeaderOptions;
 }
 
 export class OrbitApplication {
   private server: ReturnType<typeof Bun.serve> | null = null;
   private routes: RouteDefinition[] = [];
+  /** Static (no :params, no *) routes indexed as pathname → method → route. */
+  private staticRouteIndex = new Map<string, Map<string, RouteDefinition>>();
+  /** All routes with pre-split pattern segments for the fallback matcher. */
+  private compiledRoutes: { route: RouteDefinition; segments: string[]; hasWildcard: boolean }[] = [];
   private logger: Console | null = null;
   private middlewares: MiddlewareFunction[] = [];
   private moduleMiddlewareConfigs: Map<Type, MiddlewareConfiguration[]> = new Map();
@@ -49,10 +61,58 @@ export class OrbitApplication {
       const corsOptions = options.cors === true ? {} : options.cors;
       this.use(new CorsMiddleware(corsOptions));
     }
+
+    this.secureHeaderOptions =
+      options.security === false
+        ? null
+        : typeof options.security === 'object'
+          ? options.security
+          : {};
+    this.secureHeadersRecord = this.secureHeaderOptions === null
+      ? null
+      : buildSecureHeaders(this.secureHeaderOptions);
   }
+
+  private readonly secureHeaderOptions: SecureHeaderOptions | null;
+  private readonly secureHeadersRecord: Record<string, string> | null;
 
   setRoutes(routes: RouteDefinition[]): void {
     this.routes = routes;
+    this.buildRouteIndex(routes);
+  }
+
+  /** Precompute route lookup structures once at startup, not per request. */
+  private buildRouteIndex(routes: RouteDefinition[]): void {
+    this.staticRouteIndex.clear();
+    this.compiledRoutes = [];
+    for (const route of routes) {
+      const hasParams = route.path.includes(':') || route.path.includes('*');
+      this.compiledRoutes.push({
+        route,
+        segments: route.path.split('/').filter(Boolean),
+        hasWildcard: route.path.endsWith('*'),
+      });
+      if (!hasParams && route.method !== 'ALL') {
+        let byMethod = this.staticRouteIndex.get(route.path);
+        if (!byMethod) {
+          byMethod = new Map();
+          this.staticRouteIndex.set(route.path, byMethod);
+        }
+        byMethod.set(route.method, route);
+      }
+    }
+  }
+
+  /** Registered routes (method/path/controller/handler) — used by orbit-devtools. */
+  getRoutes(): RouteDefinition[] {
+    return this.routes;
+  }
+
+  /** Compiled module tree — used by orbit-devtools for the module graph. */
+  modules: unknown[] = [];
+
+  setModules(modules: unknown[]): void {
+    this.modules = modules;
   }
 
   setMiddlewareConfigurations(configs: Map<Type, MiddlewareConfiguration[]>): void {
@@ -318,32 +378,67 @@ export class OrbitApplication {
   }
 
   private async handleRequest(request: Request, handler: RequestHandler): Promise<Response> {
-    const executeMiddlewares = async (index: number): Promise<Response> => {
-      if (index < this.middlewares.length) {
-        return this.middlewares[index](request, () => executeMiddlewares(index + 1));
-      }
-      return this.routeRequest(request, handler);
-    };
-
     try {
-      return await executeMiddlewares(0);
+      const response = this.middlewares.length === 0
+        ? await this.routeRequest(request, handler)
+        : await this.executeMiddlewares(request, handler, 0);
+      return this.applySecurityHeaders(response);
     } catch (error) {
-      return this.handleError(error);
+      return this.applySecurityHeaders(this.handleError(error));
     }
   }
 
+  private executeMiddlewares(
+    request: Request,
+    handler: RequestHandler,
+    index: number
+  ): Promise<Response> {
+    if (index < this.middlewares.length) {
+      return this.middlewares[index](request, () => this.executeMiddlewares(request, handler, index + 1));
+    }
+    return this.routeRequest(request, handler);
+  }
+
+  private applySecurityHeaders(response: Response): Response {
+    if (!this.secureHeadersRecord) return response;
+    return applySecureHeaderRecord(response, this.secureHeadersRecord);
+  }
+
   private async routeRequest(request: Request, handler: RequestHandler): Promise<Response> {
-    const url = new URL(request.url);
-    const method = request.method.toUpperCase();
-    const pathname = url.pathname;
+    const method = request.method;
+    const url = request.url;
+    const start = url.indexOf('/', 8); // first slash after "scheme://"
+    let pathname: string;
+    if (start === -1) {
+      pathname = '/';
+    } else {
+      const qi = url.indexOf('?', start);
+      pathname = qi === -1 ? url.slice(start) : url.slice(start, qi);
+    }
 
-    for (const route of this.routes) {
-      if (route.method !== method && route.method !== 'ALL') continue;
+    // Fast path: static route — two map lookups, zero allocations.
+    const byMethod = this.staticRouteIndex.get(pathname);
+    if (byMethod) {
+      const route = byMethod.get(method);
+      if (route) {
+        try {
+          return await handler.handle(route, request, OrbitApplication.EMPTY_PARAMS);
+        } catch (error) {
+          return this.handleError(error);
+        }
+      }
+    }
 
-      const params = this.matchRoute(route.path, pathname);
+    // Fallback: param/wildcard routes, ALL routes, and edge cases such as
+    // trailing slashes — preserves the original matching semantics.
+    const pathSegments = pathname.split('/').filter(Boolean);
+    for (const compiled of this.compiledRoutes) {
+      if (compiled.route.method !== method && compiled.route.method !== 'ALL') continue;
+
+      const params = this.matchSegments(compiled.segments, pathSegments, compiled.hasWildcard);
       if (params !== null) {
         try {
-          return await handler.handle(route, request, params);
+          return await handler.handle(compiled.route, request, params);
         } catch (error) {
           return this.handleError(error);
         }
@@ -356,27 +451,30 @@ export class OrbitApplication {
     );
   }
 
-  private matchRoute(pattern: string, pathname: string): Record<string, string> | null {
-    const patternParts = pattern.split('/').filter(Boolean);
-    const pathParts = pathname.split('/').filter(Boolean);
+  /** Shared empty params object for static routes (handlers only read it). */
+  private static readonly EMPTY_PARAMS: Record<string, string> = Object.freeze({});
 
-    if (patternParts.length !== pathParts.length) {
-      if (!pattern.endsWith('*')) return null;
+  private matchSegments(
+    patternSegments: string[],
+    pathSegments: string[],
+    hasWildcard: boolean
+  ): Record<string, string> | null {
+    if (patternSegments.length !== pathSegments.length && !hasWildcard) {
+      return null;
     }
 
     const params: Record<string, string> = {};
 
-    for (let i = 0; i < patternParts.length; i++) {
-      const patternPart = patternParts[i];
-      const pathPart = pathParts[i];
+    for (let i = 0; i < patternSegments.length; i++) {
+      const patternPart = patternSegments[i];
+      const pathPart = pathSegments[i];
 
       if (patternPart === '*') {
         return params;
       }
 
       if (patternPart.startsWith(':')) {
-        const paramName = patternPart.slice(1);
-        params[paramName] = pathPart;
+        params[patternPart.slice(1)] = pathPart as string;
         continue;
       }
 
@@ -428,6 +526,34 @@ export class OrbitApplication {
   }
 }
 
+export interface RequestTelemetry {
+  method: string;
+  path: string;
+  status: number;
+  durationMs: number;
+  error?: { name: string; message: string; stack?: string };
+}
+
+type RequestTelemetryListener = (telemetry: RequestTelemetry) => void;
+
+const telemetryListeners = new Set<RequestTelemetryListener>();
+
+/** Register a listener fired after every handled request (used by orbit-devtools). */
+export function onRequestTelemetry(listener: RequestTelemetryListener): () => void {
+  telemetryListeners.add(listener);
+  return () => telemetryListeners.delete(listener);
+}
+
+export function emitRequestTelemetry(telemetry: RequestTelemetry): void {
+  for (const listener of telemetryListeners) {
+    try {
+      listener(telemetry);
+    } catch {
+      // telemetry must never break request handling
+    }
+  }
+}
+
 export class OrbitFactory {
   static async create(
     rootModule: Type | DynamicModule,
@@ -451,6 +577,15 @@ export class OrbitFactory {
     
     const app = new OrbitApplication(container, options);
     app.setRoutes(routes);
+    
+    // compiled module tree — used by orbit-devtools for the module graph
+    app.setModules(allModules.map((m) => ({
+      name: (m.metatype as any).name,
+      controllers: (m.controllers as any[]).map((c) => c?.name ?? String(c)),
+      providers: (m.providers as any[]).map((pr) => String('provide' in (pr as any) ? (pr as any).provide : pr)),
+      imports: (m.imports as any[]).map((im) => im.metatype?.name ?? String(im)),
+      exports: (m.exports as any[]).map((ex) => String(ex)),
+    })));
     
     const middlewareConfigs = compiler.getMiddlewareConfigurations();
     app.setMiddlewareConfigurations(middlewareConfigs);

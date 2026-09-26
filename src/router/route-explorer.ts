@@ -1,4 +1,5 @@
 import 'reflect-metadata';
+import { emitRequestTelemetry } from '../application/orbit-factory';
 import type { Type } from '../interfaces/type.interface';
 import type { HttpMethod } from '../decorators/http-methods.decorator';
 import { METADATA_KEYS } from '../metadata/constants';
@@ -19,6 +20,16 @@ export interface ParamMetadata {
   type: 'body' | 'query' | 'param' | 'headers' | 'request' | 'response' | 'ip' | 'session';
   data?: string;
   index: number;
+}
+
+interface CachedParamInfo {
+  sorted: ParamMetadata[];
+  maxIndex: number;
+  hasQuery: boolean;
+  hasBody: boolean;
+  hasHeaders: boolean;
+  /** True when any parameter needs asynchronous resolution. */
+  hasAsync: boolean;
 }
 
 const ROUTE_PARAMS_KEY = 'orbit:route:params';
@@ -85,57 +96,160 @@ export class RequestHandler {
     this.pipeline = new ExecutionPipeline(container);
   }
 
+  /** Sorted param metadata per controller+method, computed once. */
+  private paramCache = new WeakMap<Type, Map<string, CachedParamInfo>>();
+
+  private getCachedParams(controllerClass: Type, methodName: string): CachedParamInfo {
+    let byMethod = this.paramCache.get(controllerClass);
+    if (!byMethod) {
+      byMethod = new Map();
+      this.paramCache.set(controllerClass, byMethod);
+    }
+    let info = byMethod.get(methodName);
+    if (!info) {
+      const metadata = this.getParamMetadata(controllerClass.prototype, methodName);
+      const sorted = [...metadata].sort((a, b) => a.index - b.index);
+      const maxIndex = sorted.length > 0 ? Math.max(...sorted.map(m => m.index)) : -1;
+      info = {
+        sorted,
+        maxIndex,
+        hasQuery: sorted.some(m => m.type === 'query'),
+        hasBody: sorted.some(m => m.type === 'body'),
+        hasHeaders: sorted.some(m => m.type === 'headers'),
+        hasAsync: sorted.some(
+          m => m.type === 'query' || m.type === 'body' || m.type === 'headers' || m.type === 'ip'
+        ),
+      };
+      byMethod.set(methodName, info);
+    }
+    return info;
+  }
+
   async handle(
     route: RouteDefinition,
     request: Request,
     pathParams: Record<string, string>
   ): Promise<Response> {
-    const controllerInstance = await this.container.resolve(route.controller);
-    
-    const handlerFn = async () => {
-      const paramMetadata = this.getParamMetadata(route.controller.prototype, route.methodName);
-      const args = await this.resolveParams(paramMetadata, request, pathParams, route.controller, route.methodName);
-      return controllerInstance[route.methodName](...args);
-    };
+    const startedAt = Date.now();
+    let telemetryError: { name: string; message: string; stack?: string } | undefined;
 
-    const response = await this.pipeline.execute(
-      request,
-      route.controller,
-      controllerInstance,
-      route.handler,
-      route.methodName,
-      handlerFn
-    );
+    try {
+      const controllerInstance = await this.container.resolve(route.controller);
+      const paramInfo = this.getCachedParams(route.controller, route.methodName);
+      const hasPipes = this.pipeline.hasPipes(route.controller, route.methodName);
 
-    return this.applyHttpMetadata(response, route.controller.prototype, route.methodName);
+      // Fast path: only path/request params and no pipes — resolve arguments
+      // synchronously without parsing query string, body or headers.
+      const handlerFn = (paramInfo.hasAsync || hasPipes)
+        ? async () => {
+            const args = await this.resolveParamsAsync(paramInfo, request, pathParams, controllerInstance, route, hasPipes);
+            return controllerInstance[route.methodName](...args);
+          }
+        : () => {
+            const args = this.resolveParamsSync(paramInfo, request, pathParams);
+            return controllerInstance[route.methodName](...args);
+          };
+
+      const response = await this.pipeline.execute(
+        request,
+        route.controller,
+        controllerInstance,
+        route.handler,
+        route.methodName,
+        handlerFn
+      );
+
+      emitRequestTelemetry({
+        method: request.method,
+        path: route.path,
+        status: response.status,
+        durationMs: Date.now() - startedAt,
+      });
+
+      return this.applyHttpMetadata(response, route.controller.prototype, route.methodName);
+    } catch (error) {
+      telemetryError = {
+        name: (error as any)?.name ?? 'Error',
+        message: (error as any)?.message ?? String(error),
+        stack: (error as any)?.stack,
+      };
+      emitRequestTelemetry({
+        method: request.method,
+        path: route.path,
+        status: 500,
+        durationMs: Date.now() - startedAt,
+        error: telemetryError,
+      });
+      throw error;
+    }
   }
 
   private getParamMetadata(target: Object, methodName: string): ParamMetadata[] {
     return Reflect.getMetadata(ROUTE_PARAMS_KEY, target, methodName) || [];
   }
 
-  private async resolveParams(
-    metadata: ParamMetadata[],
+  /**
+   * Synchronous argument resolution for handlers that only consume
+   * @Param / @Req (no query string, body or header parsing needed).
+   */
+  private resolveParamsSync(
+    info: CachedParamInfo,
     request: Request,
-    pathParams: Record<string, string>,
-    controllerClass: Type,
-    methodName: string
-  ): Promise<any[]> {
-    if (metadata.length === 0) {
+    pathParams: Record<string, string>
+  ): any[] {
+    if (info.maxIndex < 0) {
       return [];
     }
 
-    const url = new URL(request.url);
-    const queryParams = Object.fromEntries(url.searchParams.entries());
-    
+    const args: any[] = new Array(info.maxIndex + 1).fill(undefined);
+    for (const param of info.sorted) {
+      switch (param.type) {
+        case 'param':
+          args[param.index] = param.data ? pathParams[param.data] : pathParams;
+          break;
+        case 'request':
+          args[param.index] = request;
+          break;
+        default:
+          args[param.index] = undefined;
+      }
+    }
+    return args;
+  }
+
+  /**
+   * Asynchronous argument resolution. Query string, body and header objects
+   * are parsed lazily — only when at least one parameter decorator needs them.
+   */
+  private async resolveParamsAsync(
+    info: CachedParamInfo,
+    request: Request,
+    pathParams: Record<string, string>,
+    controllerInstance: any,
+    route: RouteDefinition,
+    hasPipes: boolean
+  ): Promise<any[]> {
+    if (info.maxIndex < 0) {
+      return [];
+    }
+
+    let queryParams: Record<string, string> | undefined;
+    if (info.hasQuery) {
+      queryParams = {};
+      const qi = request.url.indexOf('?');
+      if (qi !== -1 && qi + 1 < request.url.length) {
+        for (const [key, value] of new URLSearchParams(request.url.slice(qi + 1))) {
+          queryParams[key] = value;
+        }
+      }
+    }
+
     let body: any = undefined;
-    if (['POST', 'PUT', 'PATCH'].includes(request.method)) {
+    if (info.hasBody && (request.method === 'POST' || request.method === 'PUT' || request.method === 'PATCH')) {
       try {
         const contentType = request.headers.get('content-type') || '';
         if (contentType.includes('application/json')) {
           body = await request.json();
-        } else if (contentType.includes('text/')) {
-          body = await request.text();
         } else {
           body = await request.text();
         }
@@ -144,12 +258,14 @@ export class RequestHandler {
       }
     }
 
-    const headers = Object.fromEntries(request.headers.entries());
-    const sorted = [...metadata].sort((a, b) => a.index - b.index);
-    const maxIndex = sorted.length > 0 ? Math.max(...sorted.map(m => m.index)) : -1;
-    const args: any[] = new Array(maxIndex + 1).fill(undefined);
+    let headers: Record<string, string> | undefined;
+    if (info.hasHeaders) {
+      headers = Object.fromEntries(request.headers.entries());
+    }
 
-    for (const param of sorted) {
+    const args: any[] = new Array(info.maxIndex + 1).fill(undefined);
+
+    for (const param of info.sorted) {
       let value: any;
       let paramType: 'body' | 'query' | 'param' | 'custom' = 'custom';
 
@@ -159,7 +275,7 @@ export class RequestHandler {
           paramType = 'body';
           break;
         case 'query':
-          value = param.data ? queryParams[param.data] : queryParams;
+          value = param.data ? queryParams![param.data] : queryParams;
           paramType = 'query';
           break;
         case 'param':
@@ -167,7 +283,7 @@ export class RequestHandler {
           paramType = 'param';
           break;
         case 'headers':
-          value = param.data ? headers[param.data.toLowerCase()] : headers;
+          value = param.data ? headers![param.data.toLowerCase()] : headers;
           break;
         case 'request':
           value = request;
@@ -179,15 +295,18 @@ export class RequestHandler {
           value = undefined;
       }
 
-      const controllerInstance = await this.container.resolve(controllerClass);
-      const transformedValue = await this.pipeline.transformWithPipes(
-        value,
-        { type: paramType, data: param.data },
-        controllerClass,
-        controllerInstance,
-        methodName
-      );
-      args[param.index] = transformedValue;
+      if (hasPipes) {
+        const transformedValue = await this.pipeline.transformWithPipes(
+          value,
+          { type: paramType, data: param.data },
+          route.controller,
+          controllerInstance,
+          route.methodName
+        );
+        args[param.index] = transformedValue;
+      } else {
+        args[param.index] = value;
+      }
     }
 
     return args;
