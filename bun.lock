@@ -5,7 +5,7 @@
     "": {
       "name": "@galaxy-stack/orbit-core",
       "dependencies": {
-        "@galaxy-stack/orbit-common": "^0.1.13",
+        "@galaxy-stack/orbit-common": "^0.1.14",
         "reflect-metadata": "^0.2.0",
       },
       "devDependencies": {
@@ -56,7 +56,7 @@
 
     "@changesets/write": ["@changesets/write@0.4.0", "", { "dependencies": { "@changesets/types": "^6.1.0", "fs-extra": "^7.0.1", "human-id": "^4.1.1", "prettier": "^2.7.1" } }, "sha512-CdTLvIOPiCNuH71pyDu3rA+Q0n65cmAbXnwWH84rKGiFumFzkmHNT8KHTMEchcxN+Kl8I54xGUhJ7l3E7X396Q=="],
 
-    "@galaxy-stack/orbit-common": ["@galaxy-stack/orbit-common@0.1.13", "", {}, "sha512-4dAWlL84VvgHwAG1QeuvE42zzHMQ82Hd07zGCKq9e08gg0xdObkf8tJ3iN3AG5Vp3SWUgXQuvgFHAZ7H4y9Gdg=="],
+    "@galaxy-stack/orbit-common": ["@galaxy-stack/orbit-common@0.1.14", "", {}, "sha512-hApmMVDeuwCb84aLm+d84K2HbMWfiD4FEAo2O+lsXRwDJbvCQZoupAUVPClRHG/RJrUF+fNzmh2PTzQxgBRTKQ=="],
 
     "@inquirer/external-editor": ["@inquirer/external-editor@1.0.3", "", { "dependencies": { "chardet": "^2.1.1", "iconv-lite": "^0.7.0" }, "peerDependencies": { "@types/node": ">=18" }, "optionalPeers": ["@types/node"] }, "sha512-RWbSrDiYmO4LbejWY7ttpxczuwQyZLBUyygsA9Nsv95hpzUWwnNTVQmAq3xuh7vNwCp07UTmE5i11XAEExx4RA=="],
 
