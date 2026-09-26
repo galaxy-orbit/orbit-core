@@ -1,25 +1,25 @@
 {
   "name": "@galaxy-stack/orbit-core",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Core framework for Orbit - DI Container, Module System, Router",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
     ".": {
-      "import": "./dist/index.js",
-      "types": "./dist/index.d.ts"
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
     },
     "./container": {
-      "import": "./dist/container/index.js",
-      "types": "./dist/container/index.d.ts"
+      "types": "./dist/container/index.d.ts",
+      "import": "./dist/container/index.js"
     },
     "./metadata": {
-      "import": "./dist/metadata/index.js",
-      "types": "./dist/metadata/index.d.ts"
+      "types": "./dist/metadata/index.d.ts",
+      "import": "./dist/metadata/index.js"
     }
   },
   "scripts": {
-    "build": "bun build ./src/index.ts --outdir ./dist --target bun --external reflect-metadata --external @galaxy-stack/orbit-common",
+    "build": "bun build ./src/index.ts --outdir ./dist --target bun --packages external",
     "dev": "bun --watch src/index.ts",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
@@ -28,7 +28,7 @@
   },
   "dependencies": {
     "reflect-metadata": "^0.2.0",
-    "@galaxy-stack/orbit-common": "^0.1.14"
+    "@galaxy-stack/orbit-common": "^0.1.13"
   },
   "devDependencies": {
     "@types/bun": "latest",
@@ -48,10 +48,8 @@
     "type": "git",
     "url": "git+https://github.com/galaxy-orbit/orbit-core.git"
   },
-  "homepage": "https://github.com/galaxy-orbit/orbit#readme",
+  "homepage": "https://github.com/galaxy-orbit/orbit-cli#readme",
   "bugs": {
-    "url": "https://github.com/galaxy-orbit/orbit-core/issues"
-  },
-  "build": "bun build ./src/index.ts --outdir ./dist --target bun --packages external",
-  "build:types": "bash scripts/build-types.sh"
+    "url": "https://github.com/galaxy-orbit/orbit-cli/issues"
+  }
 }
