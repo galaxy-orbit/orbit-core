@@ -130,7 +130,11 @@ export class ExecutionPipeline {
     // Fast path: no guards, no interceptors, no exception filters — run the
     // handler directly. Skips ExecutionContext construction and the
     // guard/interceptor promise chains entirely.
-    if (meta.guards.length === 0 && meta.interceptors.length === 0 && meta.filters.length === 0) {
+    // A method with pipes still needs the pipeline: this shortcut called the handler directly and
+    // silently skipped @UsePipes, so a POST with a ZodValidationPipe answered 201 for a body
+    // the schema rejects. Measured in a GymFlow backend.
+    if (meta.guards.length === 0 && meta.interceptors.length === 0 && meta.filters.length === 0
+      && !this.hasPipes(controllerClass, methodName)) {
       try {
         const result = await handlerFn();
         return this.transformToResponse(result);

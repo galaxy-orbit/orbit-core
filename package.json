@@ -1,6 +1,6 @@
 {
   "name": "@galaxy-stack/orbit-core",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "Core framework for Orbit - DI Container, Module System, Router",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",

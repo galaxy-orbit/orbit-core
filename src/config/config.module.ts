@@ -192,8 +192,10 @@ export class ConfigModule {
       if (typeof schema.safeParse === 'function') {
         const result = schema.safeParse(config);
         if (!result.success) {
-          const errors = result.error.errors
-            .map((e: any) => `${e.path.join('.')}: ${e.message}`)
+          // Zod v4 renamed `error.errors` to `error.issues`; support both.
+          const issues = result.error?.issues ?? result.error?.errors ?? [];
+          const errors = issues
+            .map((e: any) => `${e.path?.join('.') || 'value'}: ${e.message}`)
             .join(', ');
           throw new Error(`Configuration validation failed: ${errors}`);
         }

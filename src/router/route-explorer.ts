@@ -327,8 +327,14 @@ export class RequestHandler {
       }
     }
 
+    // @HttpCode() declares the SUCCESS status of the handler. Overwriting a failure with it turned
+    // a rejected body into a fake success: a POST with @HttpCode(201) whose ZodValidationPipe
+    // rejected the payload answered 201 while the body still carried the 400. Measured in a GymFlow
+    // backend (test 'POST /members trả 400 khi dữ liệu sai' expected 400, received 201).
+    const status = response.status >= 400 ? response.status : (httpCode || response.status);
+
     return new Response(response.body, {
-      status: httpCode || response.status,
+      status,
       statusText: response.statusText,
       headers: newHeaders,
     });

@@ -6,6 +6,24 @@ export interface ZodSchema {
   safeParse(data: unknown): { success: boolean; data?: unknown; error?: any };
 }
 
+/**
+ * Argument kind a validation pipe applies to. @UsePipes() runs a pipe for EVERY
+ * parameter of the method, so validating a body against a schema also throws for
+ * @Param('id') / @Query() values. Scope the pipe when the handler mixes parameters.
+ */
+export type ValidationScope = 'body' | 'query' | 'param' | 'custom';
+
+function matchesScope(
+  scope: ValidationScope | ValidationScope[] | undefined,
+  type: ArgumentMetadata['type'] | undefined
+): boolean {
+  if (!scope) {
+    return true;
+  }
+  const wanted = Array.isArray(scope) ? scope : [scope];
+  return wanted.includes((type ?? 'custom') as ValidationScope);
+}
+
 export interface ValidationPipeOptions {
   transform?: boolean;
   whitelist?: boolean;
@@ -14,6 +32,8 @@ export interface ValidationPipeOptions {
   errorHttpStatusCode?: number;
   exceptionFactory?: (errors: string[]) => any;
   schema?: ZodSchema;
+  /** Restrict validation to these argument kinds; every argument is validated when omitted. */
+  scope?: ValidationScope | ValidationScope[];
 }
 
 export class ValidationPipe implements PipeTransform {
@@ -30,6 +50,10 @@ export class ValidationPipe implements PipeTransform {
   }
 
   async transform(value: any, metadata: ArgumentMetadata): Promise<any> {
+    if (!matchesScope(this.options.scope, metadata.type)) {
+      return value;
+    }
+
     if (!value) {
       return value;
     }
@@ -64,11 +88,13 @@ export class ValidationPipe implements PipeTransform {
   }
 
   private formatZodErrors(error: any): string[] {
-    if (!error?.errors) {
+    // Zod v4 renamed `error.errors` to `error.issues`; support both.
+    const issues = error?.issues ?? error?.errors;
+    if (!Array.isArray(issues)) {
       return ['Validation failed'];
     }
 
-    return error.errors.map((err: any) => {
+    return issues.map((err: any) => {
       const path = err.path?.join('.') || 'value';
       return `${path}: ${err.message}`;
     });
@@ -76,14 +102,24 @@ export class ValidationPipe implements PipeTransform {
 }
 
 export class ZodValidationPipe implements PipeTransform {
-  constructor(private schema: ZodSchema) {}
+  constructor(
+    private schema: ZodSchema,
+    /** Restrict validation to these argument kinds; every argument is validated when omitted. */
+    private scope?: ValidationScope | ValidationScope[]
+  ) {}
 
   transform(value: any, metadata: ArgumentMetadata): any {
+    if (!matchesScope(this.scope, metadata.type)) {
+      return value;
+    }
+
     const result = this.schema.safeParse(value);
 
     if (!result.success) {
-      const errors = result.error.errors
-        .map((e: any) => `${e.path.join('.') || 'value'}: ${e.message}`)
+      // Zod v4 renamed `error.errors` to `error.issues`; support both.
+      const issues = result.error?.issues ?? result.error?.errors ?? [];
+      const errors = issues
+        .map((e: any) => `${e.path?.join('.') || 'value'}: ${e.message}`)
         .join('; ');
       throw new BadRequestException(`Validation failed: ${errors}`);
     }

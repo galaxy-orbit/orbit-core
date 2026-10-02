@@ -3,7 +3,16 @@ import 'reflect-metadata';
 import { RouteExplorer, RequestHandler } from './route-explorer';
 import { Controller, Get, Post, Injectable } from '../decorators';
 import { Container } from '../container/container';
-import { Body, Param, Query, HttpCode } from '@galaxy-stack/orbit-common';
+import { Body, Param, Query, HttpCode, UsePipes } from '@galaxy-stack/orbit-common';
+import type { ArgumentMetadata, PipeTransform } from '../pipes/validation.pipe';
+import { BadRequestException } from '@galaxy-stack/orbit-common';
+
+/** Rejects every payload the way a Zod pipe rejects a malformed body. */
+class RejectingPipe implements PipeTransform {
+  transform(_value: unknown, _metadata: ArgumentMetadata): never {
+    throw new BadRequestException('payload rejected');
+  }
+}
 import { NotFoundException } from '../exceptions';
 
 describe('RouteExplorer', () => {
@@ -102,6 +111,15 @@ describe('RequestHandler', () => {
       return body;
     }
 
+    // @HttpCode() declares the SUCCESS status: a rejecting pipe must still answer 400, or the
+    // client reads a rejected payload as a created resource (measured in a GymFlow backend).
+    @Post('/coded')
+    @HttpCode(201)
+    @UsePipes(new RejectingPipe())
+    coded(@Body() body: any) {
+      return body;
+    }
+
     @Get('/missing/:id')
     missing(@Param('id') id: string) {
       throw new NotFoundException(`User ${id} not found`);
@@ -157,6 +175,22 @@ describe('RequestHandler', () => {
 
     expect(response.status).toBe(201);
     expect(await response.json()).toEqual({ ok: true });
+  });
+
+  test('@HttpCode never overwrites a failure status', async () => {
+    const route = await findRoute('POST', '/api/coded');
+    const request = new Request('http://localhost/api/coded', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ ok: true }),
+    });
+
+    const response = await handler.handle(route, request, {});
+
+    // Before the fix the build resolved `status: httpCode || response.status`, so this answered 201
+    // while the body still carried the 400 — indistinguishable from "validation did not run".
+    expect(response.status).toBe(400);
+    expect((await response.json()).statusCode).toBe(400);
   });
 
   test('maps HttpException thrown from common to a JSON error response', async () => {
